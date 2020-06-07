@@ -1,9 +1,16 @@
 #pragma once
 
+#include <thread>
+#include <future>
+
 #include <boost/thread.hpp>
 #include <boost/circular_buffer.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
+
+#include <sys/select.h>
+#include <termios.h>
+#include <stropts.h>
 
 #include <jacl/jacl.hpp>
 #include <serial_wrapper/serial_wrapper.hpp>
@@ -11,6 +18,23 @@
 
 #define MICRON_DEBUG
 #define MICRON_ENABLE_MQTT
+#define MICRON_RUNTIME_FAULT
+
+bool _kbhit(){
+    static const int STDIN(0);
+    static bool initialized(false);
+    if(!initialized){
+        termios term;
+        tcgetattr(STDIN, &term);
+        term.c_lflag &= ~ICANON;
+        tcsetattr(STDIN, TCSANOW, &term);
+        setbuf(stdin, NULL);
+        initialized = true;
+    }
+    int bytes_waiting;
+    ioctl(STDIN, FIONREAD, &bytes_waiting);
+    return bytes_waiting > 0;
+}
 
 namespace micron{
 
@@ -31,27 +55,34 @@ namespace detail{
         return serialize(t) + serialize(ts...);
     }
     constexpr static auto RPS2RPM(60);
+    constexpr static auto DEG2RAD(M_PI/180.);
 }
 
 class Micron{
 public:
     Micron()
         : username_("C_Project")
-        , key_("aio_iBqz42cYNefQOmuypkcvzv7ya0mw")
-        , topic_("sensor-1")
+        , key_("aio_OzKR12JFu2G4NKaRpSgRdZYF0LKr")
+        , topic_("microndata")
         , mqtt_(username_, key_)
         , sw_("/dev/ttyACM0", micron::baud_rate_t(1000000))
-        , plant_(&plant_ss_, SAMPLING_RATE)
-        , sifd_(&plant_, {10.,10.,10.})
-        , kpos_(&kpos_ss_, SAMPLING_RATE)
-        , kspd_(&kspd_ss_, SAMPLING_RATE){
+        , plant_(&plant_ss_, SAMPLING_PERIOD)
+        , sifd_(&plant_, {10.,4400,2400})
+        , kpos_(&kpos_ss_, SAMPLING_PERIOD)
+        , kspd_(&kspd_ss_, SAMPLING_PERIOD){
 
         transmit_thread_ = boost::thread{boost::bind(&Micron::transmitThread, this)};
 
         jacl::parser::readStateSpace(&kpos_ss_, "../config/position_controller.jacl");
         jacl::parser::readStateSpace(&kspd_ss_, "../config/speed_controller.jacl");
         jacl::parser::readStateSpace(&plant_ss_, "../config/motor_dc_dsimo.jacl");
-        sifd_.init({{-.11,-.15}});
+        sifd_.init({{.8,.5}});
+
+        // auto f = boost::thread{[]{
+        //     char c;
+        //     std::cin >> c;
+        //     std::cout << "Input : " << c << std::endl;
+        // }};
     }
     ~Micron(){
         transmit_thread_.join();
@@ -107,7 +138,7 @@ private:
     //-- Serial comm stuff
     SerialWrapper<> sw_;   
     //-- Sampling stuff
-    static constexpr std::size_t MAX_SAMPLE_DATA{100};
+    static constexpr std::size_t MAX_SAMPLE_DATA{200};
     using sensor_pack_t = std::tuple<double,double,double>;
     std::vector<sensor_pack_t> response_sample_;
     std::vector<sensor_pack_t> error_sample_;
@@ -115,8 +146,8 @@ private:
     inline double getSpeed(const sensor_pack_t& _pack){return std::get<1>(_pack);}
     inline double getCurrent(const sensor_pack_t& _pack){return std::get<2>(_pack);}
 
-    //-- JACL or controller stuff0
-    const unsigned int SAMPLING_RATE{100}; // in microseconds, not in Hz
+    //-- JACL or controller stuff
+    static constexpr auto SAMPLING_PERIOD{.0001}; // in seconds
     //-- DC motor open-loop
     using PlantSS = jacl::state_space::Linear<double,3, 1, 3>;
     PlantSS plant_ss_;
@@ -144,9 +175,10 @@ auto Micron::go(){
     arma::mat err(ref);
     arma::mat in(ref);
     arma::mat out(3,1,arma::fill::zeros);
-    ref(0) = 90.0; // degrees
+    ref(0) = 97.0; // degrees
     std::tuple<bool,bool,bool> sensor_fault(std::make_tuple(false,false,false));
     bool gen_fault(false);
+    auto start_time = boost::chrono::high_resolution_clock::now();
     while(is_running_){
 //        err = ref - arma::vec({pres_data_[0]});
 //        in = k_pos_.propagate(err);
@@ -160,37 +192,55 @@ auto Micron::go(){
             boost::property_tree::ptree out_ptree;
             try{
                 boost::property_tree::read_json(out_json, out_ptree);
-                out(0) = out_ptree.get<double>("position");
-                out(1) = out_ptree.get<double>("speed") * detail::RPS2RPM;
-                out(2) = out_ptree.get<double>("current");
+                out(0) = out_ptree.get<double>("position") * detail::DEG2RAD;
+                out(1) = out_ptree.get<double>("speed") * (2*M_PI);
+                out(2) = out_ptree.get<double>("current") * 0.001;
                 in(0) = out_ptree.get<double>("voltage");
                        
                 #ifdef MICRON_DEBUG
                 std::cout << "[MICRON] Received : " << out_serialized << std::endl;            
-                #endif        
+                #endif
+
+                #ifdef MICRON_RUNTIME_FAULT
+                if(_kbhit()){
+                    char c = getchar();
+                    if(c == 's'){
+                        out(0) = genFault(out(0), 0., 0., 1.2);
+                    }else if(c == 'b'){
+                        out(0) = genFault(out(0), 0.5235, 0., 1.);
+                    }
+                    tcflush(0, TCIFLUSH);                    
+                }                
+                #else
                 if(gen_fault){
-                    out(0) = genFault(out(0), 0., 0., 1.);
+                    out(0) = genFault(out(0), 0., 0., 1.2);
                     out(1) = genFault(out(1), 0., 0., 1.);
                     out(2) = genFault(out(2), 0., 0., 1.);
                 }
+                #endif
+
                 jacl::diagnosis::SIFD<PlantSys, DEDICATED_STATE>::diag_pack_t diag_pack = sifd_.detect(in, out);
                 std::get<0>(sensor_fault) |= std::get<2>(diag_pack[0]);
                 std::get<1>(sensor_fault) |= std::get<2>(diag_pack[1]);
                 std::get<2>(sensor_fault) |= std::get<2>(diag_pack[2]);
+                
+                if(std::get<1>(sensor_fault) & std::get<2>(sensor_fault) || std::get<0>(sensor_fault)){
+                    std::get<0>(sensor_fault) = true;
+                    std::get<1>(sensor_fault) = false;
+                    std::get<2>(sensor_fault) = false;
+                }
 
                 if(response_sample_.size() < MAX_SAMPLE_DATA){
-                    response_sample_.emplace_back(std::make_tuple(out(0),out(1),out(2)));
+                    response_sample_.emplace_back(std::make_tuple(out(0),out(1)*detail::RPS2RPM/(2*M_PI),out(2)));
+                    std::cout << "ERROR ARUS : " << std::get<1>(diag_pack[2])(0) << std::endl;
                     error_sample_.emplace_back(std::make_tuple(std::get<1>(diag_pack[0])(0),std::get<1>(diag_pack[1])(0),std::get<1>(diag_pack[2])(0)));
 
-                    // if(response_sample_.size() > MAX_SAMPLE_DATA/4)
-                    //     gen_fault = true;
-
-                    // if(response_sample_.size() > 0)
-                    //     gen_fault = true;
+                    if(response_sample_.size() > MAX_SAMPLE_DATA/4)
+                        gen_fault = true;
 
                     if(response_sample_.size() == MAX_SAMPLE_DATA)
                         std::cout << "[MICRON] Sampling finished." << std::endl;
-                }   
+                }
 
                 //-- Send input to arduino
                 boost::property_tree::ptree in_ptree;
@@ -203,12 +253,22 @@ auto Micron::go(){
                 #endif
                 //-- prepare to publish to MQTT
                 #ifdef MICRON_ENABLE_MQTT
-                msg_ = detail::serialize("value1: ",out(0),
-                        ";status1: ",std::get<0>(sensor_fault),
-                        ";value2: ",out(1),
-                        ";status2: ",std::get<1>(sensor_fault),
-                        ";value3: ",out(2),
-                        ";status3: ",std::get<2>(sensor_fault));
+                boost::property_tree::ptree mqtt_ptree;
+                mqtt_ptree.put("value1", out(0));
+                mqtt_ptree.put("state1", std::get<0>(sensor_fault));
+                mqtt_ptree.put("value2", out(1)*detail::RPS2RPM);
+                mqtt_ptree.put("state2", std::get<1>(sensor_fault));
+                mqtt_ptree.put("value3", out(2));
+                mqtt_ptree.put("state3", std::get<2>(sensor_fault));
+                std::ostringstream out_json;
+                boost::property_tree::write_json(out_json, mqtt_ptree, false);
+                // msg_ = detail::serialize("value1: ",out(0),
+                //         ";status1: ",std::get<0>(sensor_fault),
+                //         ";value2: ",out(1),
+                //         ";status2: ",std::get<1>(sensor_fault),
+                //         ";value3: ",out(2),
+                //         ";status3: ",std::get<2>(sensor_fault));
+                msg_ = out_json.str();
                 #ifdef MICRON_DEBUG
                 std::cout << "[MICRON] MQTT msg : " << msg_ << std::endl;
                 #endif
@@ -217,7 +277,7 @@ auto Micron::go(){
                 std::cerr << "[MICRON] Failed to parse." << std::endl;
             }
         }
-        boost::this_thread::sleep_for(boost::chrono::microseconds{SAMPLING_RATE});
+        boost::this_thread::sleep_for(boost::chrono::microseconds{int(SAMPLING_PERIOD*1e6)});
     }
 }
 
